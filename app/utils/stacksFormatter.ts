@@ -1,335 +1,237 @@
 // app/utils/stacksFormatter.ts
-import { StacksTransaction } from '@/app/services/stacksApiService';
+import { StacksTransaction, StacksContractCallTransaction, StacksTokenTransferTransaction } from '@/app/services/stacksApiService'; // Ensure StacksTransaction is correctly typed
 import { SBTC_CONTRACT_ADDRESS, SBTC_BRIDGE_CONTRACT_ADDRESS } from '@/app/config/blockchain';
-import { formatAddress } from './formatUtils';
+import { formatAddress } from './formatUtils'; // Keep this
+import { analyzeSbtcOperation, SbtcOperation } from './sbtcAnalyzer'; // Import from sbtcAnalyzer
 
 /**
  * Format the value amount based on the token type
  * For STX, divide by 1000000 (Stacks uses 6 decimal places)
+ * For other FTs, you might need different decimal logic or pass decimals.
  */
 export const formatStacksValue = (value: string | number | undefined, decimals: number = 6): string => {
-  if (!value && value !== 0) return '0';
+  if (value === undefined || value === null || value === '') return '0';
   
-  const numValue = typeof value === 'string' ? parseInt(value) : value;
+  const numValue = typeof value === 'string' ? BigInt(value) : BigInt(Math.round(Number(value))); // Use BigInt for precision with micro-units
   
-  if (isNaN(numValue)) return '0';
+  if (numValue === 0n) return '0';
+
+  const factor = BigInt(Math.pow(10, decimals));
+  const integerPart = numValue / factor;
+  const fractionalPart = numValue % factor;
+
+  if (fractionalPart === 0n) {
+    return integerPart.toString();
+  }
   
-  return (numValue / Math.pow(10, decimals)).toFixed(decimals);
+  const fractionalStr = fractionalPart.toString().padStart(decimals, '0').replace(/0+$/, ''); // Remove trailing zeros from decimal part
+  return `${integerPart}.${fractionalStr === '' ? '0' : fractionalStr}`;
 };
 
-/**
- * Format memo from hex to string if present
- */
 export const formatStacksMemo = (memoHex: string | undefined): string => {
-  if (!memoHex || memoHex === '0x') return '';
-  
+  if (!memoHex || memoHex === '0x' || memoHex === '') return '';
   try {
-    // Remove 0x prefix if present
     const hex = memoHex.startsWith('0x') ? memoHex.slice(2) : memoHex;
-    
-    // Convert hex to string
+    if (hex.length === 0) return '';
     const decoded = Buffer.from(hex, 'hex').toString('utf8');
-    
-    // Remove null bytes
-    return decoded.replace(/\0/g, '').trim();
+    return decoded.replace(/\0/g, '').trim(); // Remove null bytes and trim
   } catch (error) {
-    console.error('Error decoding memo:', error);
-    return '';
+    console.error('Error decoding memo:', memoHex, error);
+    return 'Error decoding memo'; // Or return the hex itself, or an empty string
   }
 };
 
-/**
- * Check if a contract ID is related to sBTC
- */
 export const isSbtcContract = (contractId: string | undefined, subNetwork: 'mainnet' | 'testnet' = 'mainnet'): boolean => {
   if (!contractId) return false;
-  
-  // Known sBTC contract IDs
   const sbtcContracts = [
     SBTC_CONTRACT_ADDRESS[subNetwork],
     SBTC_BRIDGE_CONTRACT_ADDRESS[subNetwork],
-    // Add any other known sBTC contracts here
-    'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.wrapped-bitcoin',
-    'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.sbtc-token'
+    'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.sbtc-token', // Example, ensure these are correct
+    // Add other known sBTC or wrapped Bitcoin contract identifiers
   ];
-  
-  return sbtcContracts.some(contract => contractId.includes(contract));
+  return sbtcContracts.some(knownContract => contractId.includes(knownContract));
 };
 
-/**
- * Determine if a transaction is sBTC-related
- */
-export const isSbtcTransaction = (tx: StacksTransaction, subNetwork: 'mainnet' | 'testnet' = 'mainnet'): boolean => {
-  // Check if it's a contract call to an sBTC contract
-  if (tx.tx_type === 'contract_call' && tx.contract_call) {
-    return isSbtcContract(tx.contract_call.contract_id, subNetwork);
+export const isStacksSbtcTransaction = (tx: StacksTransaction, subNetwork: 'mainnet' | 'testnet' = 'mainnet'): boolean => {
+  if (!tx) return false;
+  if (tx.tx_type === 'contract_call') {
+    const ccTx = tx as StacksContractCallTransaction;
+    if (ccTx.contract_call && isSbtcContract(ccTx.contract_call.contract_id, subNetwork)) return true;
   }
-  
-  // Check if it's a token transfer of an sBTC token
-  if (tx.tx_type === 'token_transfer' && tx.token_transfer && tx.token_transfer.asset_identifier) {
-    return isSbtcContract(tx.token_transfer.asset_identifier, subNetwork);
+  if (tx.tx_type === 'token_transfer') {
+    const ttTx = tx as StacksTokenTransferTransaction;
+    if (ttTx.token_transfer && isSbtcContract(ttTx.token_transfer.asset_identifier, subNetwork)) return true;
   }
-  
-  // Check events for sBTC-related activity
-  if (tx.events && tx.events.length > 0) {
-    return tx.events.some(event => {
-      if (event.asset_identifier) {
-        return isSbtcContract(event.asset_identifier, subNetwork);
-      }
-      if (event.contract_identifier) {
-        return isSbtcContract(event.contract_identifier, subNetwork);
-      }
-      return false;
-    });
+  if (tx.events?.some(event => 
+      (event.contract_identifier && isSbtcContract(event.contract_identifier, subNetwork)) ||
+      (event.asset && event.asset.asset_id && isSbtcContract(event.asset.asset_id, subNetwork)) ||
+      (event.asset_identifier && isSbtcContract(event.asset_identifier, subNetwork))
+  )) {
+    return true;
   }
-  
   return false;
 };
 
-/**
- * Determine the transaction type and return a human-readable string
- */
+
 export const getTransactionTypeDisplay = (tx: StacksTransaction): string => {
   switch (tx.tx_type) {
     case 'token_transfer':
-      return 'STX Transfer';
+      const ttTx = tx as StacksTokenTransferTransaction;
+      if (ttTx.token_transfer?.asset_identifier?.includes('stx')) { // Heuristic for STX
+        return 'STX Transfer';
+      }
+      // Add more specific FT naming if possible from asset_identifier
+      return `Token Transfer (${ttTx.token_transfer?.asset_identifier ? formatAddress(ttTx.token_transfer.asset_identifier.split('::')[1] || ttTx.token_transfer.asset_identifier) : 'Unknown Token'})`;
     case 'contract_call':
-      if (tx.contract_call) {
-        // Check if it's an sBTC operation
-        const contractId = tx.contract_call.contract_id.toLowerCase();
-        
-        if (contractId.includes('sbtc') || contractId.includes('bridge') || contractId.includes('bitcoin')) {
-          const functionName = tx.contract_call.function_name.toLowerCase();
-          
-          if (functionName.includes('deposit') || functionName.includes('mint')) {
-            return 'sBTC Deposit';
-          } else if (functionName.includes('withdraw') || functionName.includes('burn')) {
-            return 'sBTC Withdrawal';
-          } else if (functionName.includes('transfer')) {
-            return 'sBTC Transfer';
-          }
-          
-          return 'sBTC Operation';
+      const ccTx = tx as StacksContractCallTransaction;
+      if (ccTx.contract_call) {
+        if (isStacksSbtcTransaction(tx, tx.network || 'mainnet')) {
+            const sbtcOp = analyzeSbtcOperation(tx, tx.network || 'mainnet');
+            if (sbtcOp) return `sBTC ${sbtcOp.type.charAt(0).toUpperCase() + sbtcOp.type.slice(1)}`;
+            return 'sBTC Operation';
         }
-        
-        return `Contract Call: ${tx.contract_call.function_name}`;
+        return `Contract Call: ${ccTx.contract_call.function_name || 'Unknown Function'}`;
       }
       return 'Contract Call';
     case 'smart_contract':
       return 'Contract Deployment';
     case 'coinbase':
       return 'Coinbase';
+    case 'poison-microblock': // Hiro API can return this
+      return 'Poison Microblock';
     default:
-      return tx.tx_type.charAt(0).toUpperCase() + tx.tx_type.slice(1).replace(/_/g, ' ');
+      return tx.tx_type ? tx.tx_type.charAt(0).toUpperCase() + tx.tx_type.slice(1).replace(/_/g, ' ') : 'Unknown Transaction';
   }
 };
 
-/**
- * Extract sBTC operation details from a transaction
- */
-export const extractSbtcOperationDetails = (tx: StacksTransaction) => {
-  if (!isSbtcTransaction(tx)) {
-    return null;
-  }
-  
-  let operationType = 'Unknown';
-  let amount = '0';
-  let recipient = '';
-  let bitcoinTxId = '';
-  
-  // Extract information from contract call
-  if (tx.tx_type === 'contract_call' && tx.contract_call) {
-    const functionName = tx.contract_call.function_name.toLowerCase();
-    
-    if (functionName.includes('deposit') || functionName.includes('mint')) {
-      operationType = 'Deposit';
-    } else if (functionName.includes('withdraw') || functionName.includes('burn')) {
-      operationType = 'Withdrawal';
-    } else if (functionName.includes('transfer')) {
-      operationType = 'Transfer';
-    }
-    
-    // Try to extract amount and recipient from function args
-    if (tx.contract_call.function_args) {
-      const amountArg = tx.contract_call.function_args.find(arg => 
-        arg.name === 'amount' || arg.name === 'value'
-      );
-      
-      const recipientArg = tx.contract_call.function_args.find(arg => 
-        arg.name === 'recipient' || arg.name === 'to'
-      );
-      
-      if (amountArg && amountArg.repr) {
-        // Try to extract numeric value (this is a simple approach, adjust as needed)
-        const match = amountArg.repr.match(/(\d+)/);
-        if (match) {
-          amount = match[0];
-        }
-      }
-      
-      if (recipientArg && recipientArg.repr) {
-        // Extract address (remove quotes, 0x, etc.)
-        recipient = recipientArg.repr.replace(/['"]|0x/g, '');
-      }
-    }
-  }
-  
-  // Extract information from token transfer
-  else if (tx.tx_type === 'token_transfer' && tx.token_transfer) {
-    operationType = 'Transfer';
-    amount = tx.token_transfer.amount || '0';
-    recipient = tx.token_transfer.recipient_address || '';
-  }
-  
-  // Look for Bitcoin transaction ID in events
-  if (tx.events) {
-    const btcTxEvent = tx.events.find(event => 
-      event.event_type === 'bitcoin_tx_id' || 
-      (event.event_type === 'print' && event.value && event.value.includes('tx'))
-    );
-    
-    if (btcTxEvent && btcTxEvent.value) {
-      bitcoinTxId = typeof btcTxEvent.value === 'string' ? 
-        btcTxEvent.value.replace(/['"]|0x/g, '') : 
-        '';
-    }
-  }
-  
-  return {
-    operationType,
-    amount: formatStacksValue(amount),
-    sender: tx.sender_address,
-    recipient: recipient || 'Unknown',
-    status: tx.tx_status === 'success' ? 'Completed' : 
-           tx.tx_status === 'pending' ? 'Pending' : 'Failed',
-    bitcoinTxId
-  };
-};
 
-/**
- * Format a full Stacks transaction for display with improved data handling
- */
-export const formatStacksTransaction = (tx: StacksTransaction) => {
-  // Handle null or undefined tx
+export const formatStacksTransaction = (tx: StacksTransaction | null) => {
   if (!tx) {
-    console.error('Received null or undefined transaction to format');
-    return {
-      id: 'Unknown',
-      type: 'Unknown',
-      status: 'Unknown',
-      sender: 'Unknown',
-      senderFull: 'Unknown',
-      blockHeight: undefined,
-      timestamp: undefined,
-      fee: '0',
-      isSbtc: false,
-      value: '0',
-      recipient: 'Unknown',
-      memo: '',
-      contractId: '',
-      functionName: '',
-      sbtcDetails: null,
-      confirmations: 0,
-      network: 'mainnet'
+    console.warn('formatStacksTransaction received null or undefined transaction');
+    return { /* return a default empty-like structure or throw error */
+      id: 'Unknown', type: 'Unknown', status: 'Unknown', sender: 'Unknown', senderFull: 'Unknown',
+      blockHeight: undefined, timestamp: 'Unknown', fee: '0', isSbtc: false, value: '0', recipient: '',
+      memo: '', contractId: '', functionName: '', sbtcDetails: null, confirmations: 0, network: 'mainnet',
+      contract_call_details: null, token_transfer_details: null, raw_tx: null
     };
   }
 
-  // Extract network from tx data if available (added by our enhanced getTransaction method)
   const networkType = tx.network || 'mainnet';
+  const txTypeDisplay = getTransactionTypeDisplay(tx);
   
-  // Get formatted transaction type
-  const txType = getTransactionTypeDisplay(tx);
-  
-  // Calculate confirmations if block_height is available
-  let confirmations = 0;
-  if (tx.confirmations) {
-    // Use pre-calculated confirmations if available
-    confirmations = tx.confirmations;
-  } else if (tx.block_height && tx.block_height > 0) {
-    // Otherwise set to 1 for confirmed transactions
-    confirmations = 1;
+  let confirmations = tx.confirmations || 0;
+  if (!confirmations && tx.block_height && tx.block_height > 0 && tx.tx_status === 'success') {
+    confirmations = 1; // At least 1 if in a block and successful
   }
   
-  // Format timestamp
   let formattedTimestamp = 'Unknown';
   if (tx.burn_block_time_iso) {
     try {
       formattedTimestamp = new Date(tx.burn_block_time_iso).toLocaleString();
-    } catch (e) {
-      console.warn('Failed to format timestamp:', e);
-      formattedTimestamp = tx.burn_block_time_iso;
-    }
+    } catch (e) { formattedTimestamp = tx.burn_block_time_iso; }
   } else if (tx.burn_block_time) {
     try {
       formattedTimestamp = new Date(tx.burn_block_time * 1000).toLocaleString();
-    } catch (e) {
-      console.warn('Failed to format timestamp from unix time:', e);
-      formattedTimestamp = `${tx.burn_block_time}`;
-    }
+    } catch (e) { formattedTimestamp = `${tx.burn_block_time}`; }
   }
-  
-  // Initialize the formatted transaction object with safe defaults
-  const formattedTx = {
+
+  const formattedTx: any = { // Use 'any' for flexibility or define a very comprehensive type
     id: tx.tx_id || 'Unknown',
-    type: txType || 'Unknown',
+    type: txTypeDisplay,
     status: tx.tx_status || 'Unknown',
     sender: formatAddress(tx.sender_address || 'Unknown'),
     senderFull: tx.sender_address || 'Unknown',
-    blockHeight: tx.block_height !== undefined ? tx.block_height : undefined,
+    blockHeight: tx.block_height,
     timestamp: formattedTimestamp,
-    fee: formatStacksValue(tx.fee_rate || '0'),
-    isSbtc: isSbtcTransaction(tx, networkType as 'mainnet' | 'testnet'),
-    value: '0',
+    fee: formatStacksValue(tx.fee_rate || '0'), // fee_rate is in microSTX
+    isSbtc: isStacksSbtcTransaction(tx, networkType as 'mainnet' | 'testnet'),
+    value: '0', // This will be for STX transfers
     recipient: '',
     memo: '',
     contractId: '',
     functionName: '',
+    args: [],
     sbtcDetails: null,
     confirmations: confirmations,
-    network: networkType
+    network: networkType,
+    raw_tx: tx, // Include the raw transaction for debugging or deeper AI inspection
   };
-  
-  // Add token transfer specific info
-  if (tx.tx_type === 'token_transfer' && tx.token_transfer) {
-    formattedTx.value = formatStacksValue(tx.token_transfer.amount || '0');
-    formattedTx.recipient = tx.token_transfer.recipient_address || 'Unknown';
-    
-    if (tx.token_transfer.memo) {
-      formattedTx.memo = formatStacksMemo(tx.token_transfer.memo);
+
+  // Populate STX transfer details
+  if (tx.stx_transfers && tx.stx_transfers.length > 0) {
+    // Summing up all STX transfers if multiple, or taking the first.
+    // For simplicity, let's take the primary (first) transfer or sum if relevant for the use case.
+    let totalStxTransferred = 0n;
+    tx.stx_transfers.forEach(stxTx => totalStxTransferred += BigInt(stxTx.amount || '0'));
+    formattedTx.value = formatStacksValue(totalStxTransferred.toString()); // Already in microSTX
+
+    if (tx.stx_transfers.length === 1) {
+        formattedTx.recipient = tx.stx_transfers[0].recipient || 'Unknown';
+        if (tx.stx_transfers[0].memo) {
+            formattedTx.memo = formatStacksMemo(tx.stx_transfers[0].memo);
+        }
+    } else if (tx.stx_transfers.length > 1) {
+        formattedTx.recipient = "Multiple Recipients"; // Or aggregate logic
+        // Memo handling for multiple transfers can be complex, maybe list them or take first.
     }
   }
-  
-  // Add contract call specific info
-  else if (tx.tx_type === 'contract_call' && tx.contract_call) {
-    formattedTx.contractId = tx.contract_call.contract_id || 'Unknown';
-    formattedTx.functionName = tx.contract_call.function_name || 'Unknown';
-    
-    // Extract contract arguments if available
-    if (tx.contract_call.function_args && tx.contract_call.function_args.length > 0) {
-      formattedTx.args = tx.contract_call.function_args.map(arg => {
-        return {
-          name: arg.name || 'unnamed',
-          type: arg.type || 'unknown',
-          value: arg.repr || 'unknown'
-        };
-      });
-    }
-    
-    // Add contract details if available (added by our enhanced getTransaction method)
-    if (tx.contract_details) {
-      formattedTx.contractDetails = tx.contract_details;
+
+  // Populate contract call details
+  if (tx.tx_type === 'contract_call') {
+    const ccTx = tx as StacksContractCallTransaction;
+    if (ccTx.contract_call) {
+        formattedTx.contractId = ccTx.contract_call.contract_id || 'Unknown';
+        formattedTx.functionName = ccTx.contract_call.function_name || 'Unknown';
+        formattedTx.args = ccTx.contract_call.function_args?.map(arg => ({
+            name: arg.name || 'unnamed',
+            type: arg.type || 'unknown',
+            value: arg.repr || 'unknown'
+        })) || [];
     }
   }
-  
-  // Add smart contract specific info
-  else if (tx.tx_type === 'smart_contract' && tx.smart_contract) {
-    formattedTx.contractId = tx.smart_contract.contract_id || 'Unknown';
+
+  // Populate smart contract deployment details
+  else if (tx.tx_type === 'smart_contract') {
+    const scTx = tx as StacksSmartContractTransaction;
+    if (scTx.smart_contract) {
+        formattedTx.contractId = scTx.smart_contract.contract_id || 'Unknown';
+        // Could add source_code if needed, but it's large: scTx.smart_contract.source_code
+    }
+  }
+
+  // Populate FT transfer details (distinct from STX value)
+  if (tx.ft_transfers && tx.ft_transfers.length > 0) {
+    formattedTx.ft_transfer_details = tx.ft_transfers.map(ft_tx => ({
+        asset_identifier: ft_tx.asset_identifier || 'Unknown Asset',
+        recipient_address: ft_tx.recipient || 'Unknown Recipient',
+        sender_address: ft_tx.sender || 'Unknown Sender',
+        amount: ft_tx.amount, // Raw amount
+        // formatted_amount: formatStacksValue(ft_tx.amount, appropriate_decimals_for_asset), // Need decimals for each FT
+    }));
   }
   
-  // Add sBTC specific info if applicable
+  // Populate sBTC specific info using sbtcAnalyzer
   if (formattedTx.isSbtc) {
-    formattedTx.sbtcDetails = extractSbtcOperationDetails(tx);
+    const sbtcAnalysis = analyzeSbtcOperation(tx, networkType as 'mainnet' | 'testnet');
+    if (sbtcAnalysis) {
+        formattedTx.sbtcDetails = {
+            type: sbtcAnalysis.type,
+            amount: sbtcAnalysis.amount, // This is sBTC amount
+            sender: sbtcAnalysis.sender,
+            recipient: sbtcAnalysis.recipient || 'N/A',
+            status: sbtcAnalysis.status,
+            bitcoinTxId: sbtcAnalysis.bitcoinTxId || 'N/A',
+            fee: sbtcAnalysis.fee, // STX fee for the sBTC op
+            memo: sbtcAnalysis.memo,
+            contractId: sbtcAnalysis.contractId,
+            functionName: sbtcAnalysis.functionName,
+            gasCostAnalysis: sbtcAnalysis.gasCostAnalysis
+        };
+        // If the primary value of the tx is sBTC, you might want to reflect that in `formattedTx.value`
+        // or have a separate field for primary asset value.
+        // For now, `formattedTx.value` is for STX. sBTC value is in `sbtcDetails.amount`.
+    }
   }
-  
+
   return formattedTx;
 };

@@ -1,40 +1,94 @@
 // app/services/stacksApiService.ts
 import { STACKS_NETWORKS } from '@/app/config/blockchain';
 
-export interface StacksTransaction {
+export interface StacksTxBase {
   tx_id: string;
-  tx_type: string;
-  tx_status: string;
-  fee_rate: string;
   nonce: number;
+  fee_rate: string;
   sender_address: string;
   sponsored: boolean;
   post_condition_mode: string;
+  post_conditions?: any[]; // Consider defining this further if needed
+  anchor_mode: string; // Corrected: AnchorMode is a type, not a direct value here from API
+  tx_status: string;
   block_hash?: string;
   block_height?: number;
   burn_block_time?: number;
   burn_block_time_iso?: string;
   canonical?: boolean;
   tx_index?: number;
-  token_transfer?: {
+  tx_type: string; // e.g., "contract_call", "token_transfer", "smart_contract"
+  confirmations?: number; // Often calculated
+  network?: 'mainnet' | 'testnet'; // Added by our service
+  contract_details?: any; // Added by our service
+}
+
+export interface StacksContractCallTransaction extends StacksTxBase {
+  tx_type: 'contract_call';
+  contract_call: {
+    contract_id: string;
+    function_name: string;
+    function_signature?: string;
+    function_args?: Array<{
+      hex: string;
+      name: string;
+      repr: string;
+      type: string;
+    }>;
+  };
+}
+
+export interface StacksTokenTransferTransaction extends StacksTxBase {
+  tx_type: 'token_transfer';
+  token_transfer: {
     recipient_address: string;
     amount: string;
     memo?: string;
+    asset_identifier?: string; // Added: Important for identifying the token
   };
-  contract_call?: {
-    contract_id: string;
-    function_name: string;
-    function_args?: any[];
-  };
-  smart_contract?: {
+}
+
+export interface StacksSmartContractTransaction extends StacksTxBase {
+  tx_type: 'smart_contract';
+  smart_contract: {
     contract_id: string;
     source_code: string;
   };
-  events?: any[];
-  network?: string;
-  confirmations?: number;
-  contract_details?: any;
 }
+
+export interface StacksCoinbaseTransaction extends StacksTxBase {
+    tx_type: 'coinbase';
+    coinbase_payload: {
+        data: string;
+    }
+}
+
+// Union type for StacksTransaction
+export type StacksTransaction = (StacksContractCallTransaction | StacksTokenTransferTransaction | StacksSmartContractTransaction | StacksCoinbaseTransaction | StacksTxBase) & {
+  // Common fields that might not be strictly typed by tx_type but are often present
+  stx_transfers?: Array<{ // Micro-STX
+    amount: string;
+    sender: string;
+    recipient: string;
+    memo?: string;
+  }>;
+  ft_transfers?: Array<{
+    asset_identifier: string;
+    amount: string;
+    sender: string;
+    recipient: string;
+    tx_id: string; // Can be redundant
+  }>;
+  nft_transfers?: Array<{
+    asset_identifier: string;
+    value: { hex: string; repr: string }; // Often a uint for token ID
+    sender: string;
+    recipient: string;
+    tx_id: string; // Can be redundant
+  }>;
+  events?: any[]; // Consider defining event structure if used extensively
+};
+
 
 export interface StacksBalance {
   stx: {
@@ -49,8 +103,8 @@ export interface StacksBalance {
     burnchain_lock_height: number;
     burnchain_unlock_height: number;
   };
-  fungible_tokens: Record<string, { balance: string }>;
-  non_fungible_tokens: Record<string, { count: string }>;
+  fungible_tokens: Record<string, { balance: string; total_sent?: string; total_received?: string; }>;
+  non_fungible_tokens: Record<string, { count: string; total_sent?: string; total_received?: string; }>;
 }
 
 export interface StacksAddressData {
@@ -71,10 +125,12 @@ export interface StacksBlock {
   burn_block_time: number;
   burn_block_time_iso: string;
   burn_block_hash: string;
-  tx_count: number;
+  txs: string[]; // Array of transaction IDs
+  // Optional: Add tx_count if the API directly provides it, otherwise calculate from txs.length
+  tx_count?: number;
 }
 
-export interface SbtcOperation {
+export interface SbtcOperation { // This seems like a custom interface for your sBTC logic
   txid: string;
   operation_type: 'deposit' | 'withdrawal' | 'transfer';
   sender: string;
@@ -97,76 +153,49 @@ export class StacksApiService {
     this.apiUrl = STACKS_NETWORKS[network].apiUrl;
   }
 
-  /**
-   * Helper to make API requests through our proxy
-   */
   private async fetchFromApi(endpoint: string): Promise<any> {
     try {
-      // Construct the full URL properly
       const fullUrl = `${this.apiUrl}${endpoint}`;
-      
-      // Properly encode the URL
       const encodedUrl = encodeURIComponent(fullUrl);
-      
-      console.log(`Fetching from Stacks API: ${fullUrl}`);
-      
-      // Use absolute URL format with origin
-      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      const origin = typeof window !== 'undefined' ? window.location.origin : (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
       const requestUrl = `${origin}/api/blockchain-data?url=${encodedUrl}`;
       
       const response = await fetch(requestUrl);
       
       if (!response.ok) {
-        throw new Error(`Stacks API Error: ${response.status} ${response.statusText}`);
+        const errorBody = await response.text();
+        console.error(`Stacks API Error ${response.status} for ${fullUrl}: ${errorBody}`);
+        throw new Error(`Stacks API Error: ${response.status} ${response.statusText} - ${errorBody}`);
       }
       
       return await response.json();
     } catch (error) {
-      console.error('Error fetching from Stacks API:', error);
+      console.error(`Error fetching from Stacks API endpoint ${endpoint}:`, error);
       throw error;
     }
   }
 
-  /**
-   * Fetch a transaction by its ID with enhanced error handling and data enrichment
-   */
   async getTransaction(txId: string): Promise<StacksTransaction> {
     try {
-      // Ensure transaction ID is properly formatted (should have 0x prefix)
       const normalizedTxId = txId.startsWith('0x') ? txId : `0x${txId}`;
+      console.log(`Workspaceing Stacks transaction: ${normalizedTxId} from network: ${this.network}`);
       
-      console.log(`Fetching Stacks transaction: ${normalizedTxId} from network: ${this.network}`);
+      const txData = await this.fetchFromApi(`/extended/v1/tx/${normalizedTxId}`) as StacksTransaction;
       
-      // Fetch the basic transaction data
-      const txData = await this.fetchFromApi(`/extended/v1/tx/${normalizedTxId}`);
+      let enrichedTxData = { ...txData, network: this.network };
       
-      // Enrich the transaction data with additional context
-      let enrichedTxData = { ...txData };
-      
-      // Add network context
-      enrichedTxData.network = this.network;
-      
-      // Try to fetch additional details based on transaction type
       try {
-        if (txData.tx_type === 'contract_call' && txData.contract_call) {
-          // For contract calls, get more contract details
-          const contractId = txData.contract_call.contract_id;
-          const contractParts = contractId.split('.');
-          
-          if (contractParts.length === 2) {
-            try {
-              const contractInfo = await this.getContractInfo(contractId);
-              enrichedTxData.contract_details = contractInfo;
-            } catch (contractError) {
-              console.warn(`Could not fetch contract details for ${contractId}:`, contractError);
-            }
+        if (txData.tx_type === 'contract_call' && (txData as StacksContractCallTransaction).contract_call) {
+          const contractId = (txData as StacksContractCallTransaction).contract_call.contract_id;
+          try {
+            enrichedTxData.contract_details = await this.getContractInfo(contractId);
+          } catch (contractError) {
+            console.warn(`Could not fetch contract details for ${contractId}:`, contractError);
           }
         }
         
-        // For transactions that are already confirmed in a block, get the exact block confirmation count
         if (txData.block_height && txData.block_height > 0) {
           try {
-            // Get latest block info to calculate confirmation count
             const latestBlocks = await this.getRecentBlocks(1);
             if (latestBlocks && latestBlocks.length > 0) {
               const latestHeight = latestBlocks[0].height;
@@ -178,76 +207,59 @@ export class StacksApiService {
         }
       } catch (enrichmentError) {
         console.warn('Error during transaction data enrichment:', enrichmentError);
-        // Continue with the basic transaction data we already have
       }
       
       return enrichedTxData;
     } catch (error) {
-      console.error('Error fetching Stacks transaction:', error);
+      console.error('Error fetching Stacks transaction in StacksApiService:', error);
       throw error;
     }
   }
 
-  /**
-   * Fetch data for a Stacks address
-   */
   async getAddressData(address: string, limit = 20): Promise<StacksAddressData> {
     try {
       const balance = await this.fetchFromApi(`/extended/v1/address/${address}/balances`);
-      const transactions = await this.fetchFromApi(`/extended/v1/address/${address}/transactions?limit=${limit}`);
+      const transactions = await this.fetchFromApi(`/extended/v1/address/${address}/transactions?limit=${limit}&unanchored=true`); // Added unanchored=true
       
       return {
         balance,
         transactions
       };
     } catch (error) {
-      console.error('Error fetching Stacks address:', error);
+      console.error('Error fetching Stacks address data:', error);
       throw error;
     }
   }
 
-  /**
-   * Fetch a block by its hash or height
-   */
   async getBlock(hashOrHeight: string | number): Promise<StacksBlock> {
     try {
       const data = await this.fetchFromApi(`/extended/v1/block/${hashOrHeight}`);
-      return data;
+      return { ...data, tx_count: data.txs?.length || 0 }; // Ensure tx_count is present
     } catch (error) {
       console.error('Error fetching Stacks block:', error);
       throw error;
     }
   }
 
-  /**
-   * Fetch recent blocks
-   */
   async getRecentBlocks(limit = 10): Promise<StacksBlock[]> {
     try {
       const data = await this.fetchFromApi(`/extended/v1/block?limit=${limit}`);
-      
       if (!data || !data.results || !Array.isArray(data.results)) {
-        throw new Error('Invalid response format from Stacks API');
+        throw new Error('Invalid response format for recent Stacks blocks');
       }
-      
-      return data.results;
+      return data.results.map((block: any) => ({ ...block, tx_count: block.txs?.length || 0 }));
     } catch (error) {
       console.error('Error fetching recent Stacks blocks:', error);
       throw error;
     }
   }
 
-  /**
-   * Fetch recent transactions
-   */
   async getRecentTransactions(limit = 10): Promise<StacksTransaction[]> {
     try {
-      const data = await this.fetchFromApi(`/extended/v1/tx?limit=${limit}`);
-      
+      const data = await this.fetchFromApi(`/extended/v1/tx?limit=${limit}&unanchored=true`); // Added unanchored=true
       if (!data || !data.results || !Array.isArray(data.results)) {
-        throw new Error('Invalid response format from Stacks API');
+        throw new Error('Invalid response format for recent Stacks transactions');
       }
-      
       return data.results;
     } catch (error) {
       console.error('Error fetching recent Stacks transactions:', error);
@@ -255,118 +267,42 @@ export class StacksApiService {
     }
   }
 
-  /**
-   * Fetch sBTC operations
-   * Note: This function identifies sBTC related transactions by filtering
-   * contract calls and token transfers that interact with known sBTC contracts
-   */
   async getSbtcOperations(limit = 20): Promise<SbtcOperation[]> {
+    // This method requires a more robust way to identify sBTC ops,
+    // likely by querying specific contract events or using a specialized indexer.
+    // The previous implementation was a basic filter.
+    console.warn("getSbtcOperations current implementation is a placeholder and may not be comprehensive.");
     try {
-      // Fetch recent transactions
-      const data = await this.fetchFromApi(`/extended/v1/tx?limit=${limit}`);
-      
-      if (!data || !data.results || !Array.isArray(data.results)) {
-        throw new Error('Invalid response format from Stacks API');
-      }
-      
-      // Known sBTC contract IDs (These should be updated with actual contract IDs)
-      const knownSbtcContracts = [
-        'SP3DX3H4FEYZJZ586MFBS25ZW3HZDMEW92260R2PR.arkadiko-sbtc-v1-1-bridge',
-        'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.sbtc',
-        'SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.wrapped-bitcoin',
-        'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.sbtc-token'
-      ];
-      
-      // Filter and process sBTC-related transactions
-      const sbtcOperations: SbtcOperation[] = [];
-      
-      for (const tx of data.results) {
-        let isSbtcOperation = false;
-        let operationType: 'deposit' | 'withdrawal' | 'transfer' = 'transfer';
-        let sender = tx.sender_address;
-        let recipient = '';
-        let amount = '0';
-        
-        // Check if it's a contract call to a known sBTC contract
-        if (tx.tx_type === 'contract_call' && tx.contract_call) {
-          const contractId = tx.contract_call.contract_id;
-          
-          if (knownSbtcContracts.some(id => contractId.includes(id))) {
-            isSbtcOperation = true;
-            
-            // Determine operation type based on function name
-            const functionName = tx.contract_call.function_name.toLowerCase();
-            
-            if (functionName.includes('deposit') || functionName.includes('mint')) {
-              operationType = 'deposit';
-            } else if (functionName.includes('withdraw') || functionName.includes('burn')) {
-              operationType = 'withdrawal';
+        const recentTxs = await this.getRecentTransactions(limit * 2); // Fetch more to filter
+        const sbtcOps: SbtcOperation[] = [];
+        for (const tx of recentTxs) {
+            if (isSbtcTransaction(tx, this.network)) { // Assuming isSbtcTransaction is robust
+                const details = extractSbtcOperationDetails(tx); // Assuming this gives SbtcOperation like structure
+                if (details) {
+                    sbtcOps.push({
+                        txid: tx.tx_id,
+                        operation_type: details.operationType.toLowerCase() as SbtcOperation['operation_type'],
+                        sender: details.sender,
+                        recipient: details.recipient,
+                        amount: details.amount, // This should be sBTC amount
+                        status: details.status.toLowerCase() as SbtcOperation['status'],
+                        timestamp: tx.burn_block_time_iso || new Date().toISOString(),
+                        bitcoin_tx_id: details.bitcoinTxId
+                    });
+                }
             }
-            
-            // Try to extract recipient and amount from function args if available
-            if (tx.contract_call.function_args && tx.contract_call.function_args.length > 0) {
-              // This is a simplified approach - in production, you'd parse the args more carefully
-              const recipientArg = tx.contract_call.function_args.find((arg: any) => 
-                arg.name === 'recipient' || arg.name === 'to'
-              );
-              
-              const amountArg = tx.contract_call.function_args.find((arg: any) => 
-                arg.name === 'amount' || arg.name === 'value'
-              );
-              
-              if (recipientArg && recipientArg.repr) {
-                recipient = recipientArg.repr.replace(/['"]|0x/g, '');
-              }
-              
-              if (amountArg && amountArg.repr) {
-                // Extract numeric value from repr
-                const match = amountArg.repr.match(/(\d+)/);
-                amount = match ? match[0] : '0';
-              }
-            }
-          }
+            if (sbtcOps.length >= limit) break;
         }
-        
-        // Check if it's a token transfer of an sBTC token
-        else if (tx.tx_type === 'token_transfer' && tx.token_transfer) {
-          const assetId = tx.token_transfer.asset_identifier;
-          
-          if (assetId && knownSbtcContracts.some(id => assetId.includes(id))) {
-            isSbtcOperation = true;
-            operationType = 'transfer';
-            recipient = tx.token_transfer.recipient_address;
-            amount = tx.token_transfer.amount;
-          }
-        }
-        
-        if (isSbtcOperation) {
-          sbtcOperations.push({
-            txid: tx.tx_id,
-            operation_type: operationType,
-            sender,
-            recipient: recipient || 'unknown',
-            amount,
-            status: tx.tx_status === 'success' ? 'completed' : 
-                   tx.tx_status === 'pending' ? 'pending' : 'failed',
-            timestamp: tx.burn_block_time_iso || new Date().toISOString(),
-            bitcoin_tx_id: tx.events?.find((e: any) => e.event_type === 'bitcoin_tx_id')?.value
-          });
-        }
-      }
-      
-      return sbtcOperations;
+        return sbtcOps;
     } catch (error) {
-      console.error('Error fetching sBTC operations:', error);
-      throw error;
+        console.error('Error fetching sBTC operations:', error);
+        throw error;
     }
   }
 
-  /**
-   * Fetch the current mempool information
-   */
   async getMempoolInfo() {
     try {
-      const data = await this.fetchFromApi(`/extended/v1/tx/mempool`);
+      const data = await this.fetchFromApi(`/extended/v1/tx/mempool?unanchored=true`);
       return data;
     } catch (error) {
       console.error('Error fetching Stacks mempool:', error);
@@ -374,9 +310,6 @@ export class StacksApiService {
     }
   }
 
-  /**
-   * Get fee estimates
-   */
   async getFeeEstimate() {
     try {
       const data = await this.fetchFromApi(`/v2/fees/transfer`);
@@ -387,16 +320,48 @@ export class StacksApiService {
     }
   }
   
-  /**
-   * Fetch contract data
-   */
   async getContractInfo(contractId: string) {
     try {
-      const data = await this.fetchFromApi(`/v2/contracts/interface/${contractId}`);
+      // The API endpoint for contract interface might be different or require splitting contract_id
+      const parts = contractId.split('.');
+      if (parts.length !== 2) throw new Error("Invalid contract ID format for interface lookup.");
+      const contractAddress = parts[0];
+      const contractName = parts[1];
+      const data = await this.fetchFromApi(`/v2/contracts/interface/${contractAddress}/${contractName}`);
       return data;
     } catch (error) {
       console.error('Error fetching Stacks contract info:', error);
-      throw error;
+      throw error; // Rethrow or handle as needed
     }
   }
+}
+
+// Helper functions from stacksFormatter (or ensure they are imported and used correctly)
+// These are conceptual stubs for what should be in stacksFormatter.ts
+function isSbtcTransaction(tx: StacksTransaction, network: 'mainnet' | 'testnet'): boolean {
+    // Dummy implementation - replace with actual logic from sbtcAnalyzer.ts or stacksFormatter.ts
+    if (!tx) return false;
+    const sbtcContractIdPart = network === 'mainnet' ? SBTC_CONTRACT_ADDRESS.mainnet.split('.')[1] : SBTC_CONTRACT_ADDRESS.testnet.split('.')[1];
+    if (tx.tx_type === 'contract_call') {
+        const ccTx = tx as StacksContractCallTransaction;
+        return ccTx.contract_call?.contract_id.includes(sbtcContractIdPart);
+    }
+    if (tx.tx_type === 'token_transfer') {
+        const ttTx = tx as StacksTokenTransferTransaction;
+        return ttTx.token_transfer?.asset_identifier?.includes(sbtcContractIdPart) ?? false;
+    }
+    return false;
+}
+
+function extractSbtcOperationDetails(tx: StacksTransaction): any {
+    // Dummy implementation - replace with actual logic from sbtcAnalyzer.ts
+    if (!isSbtcTransaction(tx, tx.network || 'mainnet')) return null;
+    return {
+        operationType: 'Transfer', // Example
+        amount: '0.123', // Example sBTC amount
+        sender: tx.sender_address,
+        recipient: 'SP...', // Example
+        status: tx.tx_status === 'success' ? 'Completed' : 'Pending',
+        bitcoinTxId: 'dummybtctxid...',
+    };
 }

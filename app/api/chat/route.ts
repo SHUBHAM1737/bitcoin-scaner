@@ -1,34 +1,47 @@
 // app/api/chat/route.ts
 import { OpenAIStream, StreamingTextResponse } from 'ai';
 import OpenAI from 'openai';
-import { BitcoinAnalyzerService } from '@/app/services/bitcoinAnalyzerService';
-import { getTransactionType } from '@/app/utils/addressValidator';
+import { BitcoinAnalyzerService }
+from '@/app/services/bitcoinAnalyzerService';
+import { getTransactionType }
+from '@/app/utils/addressValidator';
+import { BIP300Service }
+from '@/app/services/bip300Service';
+import {
+  BITCOIN_NETWORKS,
+  STACKS_NETWORKS
+} from '@/app/config/blockchain';
+import { StacksApiService, StacksTransaction } // Assuming StacksTransaction is correctly typed in StacksApiService
+from '@/app/services/stacksApiService';
+import { formatStacksTransaction } // Make sure this is correctly imported
+from '@/app/utils/stacksFormatter';
 
 // Create an OpenAI API client
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || '',
 });
 
-// System prompt for general transaction analysis
-const SYSTEM_PROMPT = `You are BitcoinInsightAI, an advanced AI-powered blockchain transaction analyzer specializing in Bitcoin and sBTC on the Stacks blockchain. Provide deep insights about transactions in a specific format for the BitcoinInsightAI Explorer interface.
+const SYSTEM_PROMPT = `You are BitcoinInsightAI, an advanced AI-powered blockchain transaction analyzer specializing in Bitcoin, Stacks, sBTC, and BIP300 Sidechains. Provide deep insights about transactions or blocks in a specific format for the BitcoinInsightAI Explorer interface.
 
 IMPORTANT FORMATTING RULES:
-1. You MUST first create a Mermaid diagram visualization of the transaction.
+1. You MUST first create a Mermaid diagram visualization of the transaction or block structure if applicable.
 2. You MUST use the exact section headers and format below.
-3. Your response MUST start with a mermaid diagram inside triple backticks.
-
-Format your entire response exactly as follows:
+3. Your response MUST start with a mermaid diagram inside triple backticks if a diagram is applicable. If not, start with the TRANSACTION OVERVIEW or BLOCK OVERVIEW.
+4. For each field (e.g., Type, Chain, Block Height, Amount, Fee Paid), you MUST provide the actual data from the 'Data' JSON provided later in this prompt. If data for a field is not available or not applicable, state "Not available". DO NOT use generic placeholders like "[value]", "[number]", etc.
+5. Ensure all monetary values are appropriately formatted with their currency (e.g., BTC, STX, sats/vB, µSTX).
 
 \`\`\`mermaid
 graph LR
     %% Node Styling
     classDef wallet fill:#f7931a,stroke:#c27214,stroke-width:2px;
     classDef contract fill:#5546FF,stroke:#3b30c9,stroke-width:2px;
+    classDef blockDef fill:#8f8f8f,stroke:#555,stroke-width:2px;
     classDef value fill:#fff1e5,stroke:#b35900,stroke-width:2px;
 
     %% Create nodes for sender, receiver, and any contracts
     A[From: 0x123...] -->|transfer value| B[To: 0x456...]
-    %% Replace this with actual transaction flow
+    %% Replace this with actual transaction flow based on the provided 'Data' JSON
+    %% For blocks, show block and its connections or key contents.
     
     %% Apply styling
     class A wallet;
@@ -36,323 +49,318 @@ graph LR
 \`\`\`
 
 ---Section---
-TRANSACTION OVERVIEW:
-- Type: [Transaction Type] (Complexity score: Simple/Moderate/Complex/Very Complex)
+TRANSACTION OVERVIEW: %% Or BLOCK OVERVIEW: if analyzing a block
+- Type: (Include complexity score: Simple/Moderate/Complex/Very Complex for transactions)
 - Brief summary of what occurred in 8-10 sentences.
-- Number of inputs/outputs or contract interactions involved
-- Notable features or patterns
+- Number of inputs/outputs or contract interactions involved (for transactions), or transaction count (for blocks).
+- Notable features or patterns.
 
 ---Section---
 NETWORK DETAILS:
-- Chain: [Chain Name] (Bitcoin or Stacks)
-- Block Height: [number]
-- Timestamp: [date and time]
-- Confirmations: [number]
-- Network Status: [Mainnet/Testnet]
+- Chain:
+- Block Height:
+- Timestamp:
+- Confirmations:
+- Network Status: (Mainnet/Testnet)
 
 ---Section---
-TRANSFER ANALYSIS:`;
+TRANSFER ANALYSIS: %% Or BLOCK CONTENTS: for blocks
+`;
 
-// Bitcoin-specific analysis format
 const BITCOIN_ANALYSIS_FORMAT = `
 For Bitcoin transactions:
 
 ---Sub Section---
 Inputs:
-- Address: [address]
-- Amount: [value] BTC
-- Type: [P2PKH, P2SH, etc.]
+- Address:
+- Amount:
+- Type:
 
 ---Sub Section---
 Outputs:
-- Address: [address]
-- Amount: [value] BTC
-- Type: [P2PKH, P2SH, etc.]
-- Spent: [Yes/No/Unknown]
+- Address:
+- Amount:
+- Type:
+- Spent:
 
 ---Section---
 FEE ANALYSIS:
-- Fee Paid: [value] BTC
-- Fee Rate: [value] sats/vB
-- Efficiency: [comparison to network average]
+- Fee Paid:
+- Fee Rate:
+- Efficiency:
 `;
 
-// Stacks-specific analysis format
 const STACKS_ANALYSIS_FORMAT = `
 For Stacks transactions:
 
 ---Sub Section---
 STX Transfers:
-- Amount: [value] STX
-- From: [address]
-- To: [address]
-- Memo: [if available]
+- Amount:
+- From:
+- To:
+- Memo:
 
 ---Sub Section---
 sBTC Operations:
-- Type: [Deposit, Withdrawal, Transfer, etc.]
-- Amount: [value] sBTC
-- From: [address]
-- To: [address]
-- Status: [Completed, Pending, etc.]
-- Associated Bitcoin Transaction: [hash if available]
+- Type:
+- Amount:
+- From:
+- To:
+- Status:
+- Associated Bitcoin Transaction:
 
 ---Sub Section---
 Contract Interactions:
-- Contract: [contract name and address]
-- Function: [function name]
-- Arguments: [simplified function arguments]
-- Purpose: [brief description of function purpose]
+- Contract:
+- Function:
+- Arguments:
+- Purpose:
 
 ---Section---
 FEE ANALYSIS:
-- Fee Paid: [value] STX
-- Fee Rate: [value] µSTX
-- Efficiency: [comparison to network average]
-- For sBTC transactions, explain both Bitcoin and Stacks fees if applicable
+- Fee Paid:
+- Fee Rate:
+- Efficiency:
+- For sBTC transactions, explain both Bitcoin and Stacks fees if applicable:
 `;
 
-// BIP300 Sidechain analysis format
 const SIDECHAIN_ANALYSIS_FORMAT = `
 For BIP300 Sidechain transactions:
 
 ---Sub Section---
 Transfers:
-- Amount: [value] BTC
-- From: [address]
-- To: [address]
-- Type: [transfer, deposit, withdrawal, etc.]
+- Amount:
+- From:
+- To:
+- Type:
 
 ---Sub Section---
 Operations:
-- Type: [operation type]
-- Description: [detailed description of the operation]
-- Status: [Completed, Pending, etc.]
-- Associated Bitcoin Transaction: [hash if available]
+- Type:
+- Description:
+- Status:
+- Associated Bitcoin Transaction:
 
 ---Sub Section---
 Contract Interactions:
-- Contract: [contract name and address]
-- Function: [function name]
-- Arguments: [simplified function arguments]
-- Purpose: [brief description of function purpose]
+- Contract:
+- Function:
+- Arguments:
+- Purpose:
 
 ---Section---
 FEE ANALYSIS:
-- Fee Paid: [value] BTC
-- Fee Rate: [value] sats/byte
-- Efficiency: [comparison to network average]
-- Security considerations related to fee
+- Fee Paid:
+- Fee Rate:
+- Efficiency:
+- Security considerations related to fee:
 `;
 
-// Common completion format for both chains
+const BLOCK_ANALYSIS_FORMAT_COMMON = `
+---Sub Section---
+Block Summary:
+- Hash:
+- Height:
+- Timestamp:
+- Transaction Count:
+- Size:
+- Miner/Proposer:
+- Difficulty/Weight:
+- Confirmations:
+- Previous Block Hash:
+- Merkle Root:
+
+---Sub Section---
+Key Transactions (Sample - list a few if many, providing TxID, primary amount/action, and key parties):
+- TxID: Action: (e.g., Value: 0.5 BTC, From: ..., To: ...)
+- TxID: Action: (e.g., Contract Call: someFunction by ...)
+
+---Section---
+FEE ANALYSIS: %% (If applicable to blocks, e.g. total fees collected)
+- Total Fees in Block:
+- Average Fee Rate in Block:
+`;
+
 const COMMON_COMPLETION_FORMAT = `
 ---Section---
 SECURITY ASSESSMENT:
-Risk Level: [Low/Medium/High]
-- Contract verification status if applicable
-- Known risks or warnings for sBTC operations
-- Notable security considerations
+Risk Level: (Low/Medium/High for transactions)
+- Contract verification status if applicable:
+- Known risks or warnings for sBTC operations:
+- Notable security considerations:
 
 ---Section---
 ADDITIONAL INSIGHTS:
-- Context about this transaction type in the Bitcoin/Stacks ecosystem
-- How this transaction relates to sBTC and Bitcoin's programmability
-- Recommendations for similar transactions or optimization
-- For developers: relevant API endpoints or contract methods`;
+- Context about this transaction/block type in the ecosystem:
+- How this transaction relates to sBTC and Bitcoin's programmability (if applicable):
+- Recommendations for similar transactions or optimization (for transactions):
+- For developers: relevant API endpoints or contract methods:
+`;
 
-// POST handler for chat API
-export async function POST(req) {
+export async function POST(req: Request) {
   try {
-    // Parse request
     const { messages, txHash, network, subNetwork } = await req.json();
     
-    // Add transaction hash info to the last message if provided
     const userMessages = [...messages];
-    let transactionData = null;
-    let transactionNetwork = network || 'bitcoin';
-    let selectedSubNetwork = subNetwork || 'mainnet';
+    let itemData: any = null; 
+    let analysisType: 'transaction' | 'block' | 'address' | 'question' = 'question';
+    let determinedNetwork = network || 'bitcoin'; 
+    let determinedSubNetwork = subNetwork || 'mainnet'; 
     
+    const lastUserMessageContent = userMessages.length > 0 && userMessages[userMessages.length - 1].role === 'user' 
+                                   ? userMessages[userMessages.length - 1].content.toLowerCase() 
+                                   : "";
+    const isBlockAnalysisRequest = lastUserMessageContent.includes('block');
+
     if (txHash && typeof txHash === 'string' && txHash.trim() !== '') {
-      // Determine transaction type
-      const txType = getTransactionType(txHash);
-      if (txType === 'bitcoin') {
-        transactionNetwork = 'bitcoin';
-      } else if (txType === 'stacks') {
-        transactionNetwork = 'stacks';
+      analysisType = isBlockAnalysisRequest ? 'block' : 'transaction';
+      const txTypeFromHash = getTransactionType(txHash);
+
+      if (network && network.startsWith('sidechain-')) {
+        determinedNetwork = network; 
+        determinedSubNetwork = network.split('-')[1]; 
+      } else if (network && (network === 'bitcoin' || network === 'stacks')) {
+        determinedNetwork = network; 
+        determinedSubNetwork = subNetwork || 'mainnet';
+      } else if (txTypeFromHash === 'bitcoin') {
+        determinedNetwork = 'bitcoin';
+        determinedSubNetwork = subNetwork || 'mainnet';
+      } else if (txTypeFromHash === 'stacks') {
+        determinedNetwork = 'stacks';
+        determinedSubNetwork = subNetwork || 'mainnet';
       }
-      
+
       try {
-        console.log(`Analyzing ${transactionNetwork} transaction: ${txHash}`);
+        console.log(`Attempting to analyze ${determinedNetwork} ${analysisType}: ${txHash} on ${determinedSubNetwork}`);
         
-        // Ensure Stacks txs always have 0x prefix
-        const normalizedTxHash = 
-          transactionNetwork === 'stacks' && !txHash.startsWith('0x') 
+        const normalizedId = 
+          (determinedNetwork === 'stacks' && analysisType === 'transaction' && !txHash.startsWith('0x')) 
             ? `0x${txHash}` 
             : txHash;
+
+        if (determinedNetwork.startsWith('sidechain-')) {
+            const currentSidechainType = determinedSubNetwork;
+            const bip300Service = new BIP300Service(currentSidechainType);
+            if (analysisType === 'block') {
+                itemData = await bip300Service.getBlock(normalizedId);
+            } else {
+                itemData = await bip300Service.getTransaction(normalizedId);
+            }
+        } else if (determinedNetwork === 'bitcoin') {
+            const origin = typeof window !== 'undefined' ? window.location.origin : (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
+            const networkConfig = BITCOIN_NETWORKS[determinedSubNetwork as 'mainnet' | 'testnet'] || BITCOIN_NETWORKS.mainnet;
+            let itemApiUrl;
+            if (analysisType === 'block') {
+                 itemApiUrl = `${networkConfig.apiUrl}/block/${normalizedId}`;
+            } else { 
+                 itemApiUrl = `${networkConfig.apiUrl}/tx/${normalizedId}`;
+            }
+            console.log(`Workspaceing Bitcoin data from: ${itemApiUrl}`);
+            const response = await fetch(`${origin}/api/blockchain-data?url=${encodeURIComponent(itemApiUrl)}`);
+            if (!response.ok) {
+                const errorBody = await response.text();
+                console.error(`Failed to fetch Bitcoin ${analysisType} from ${itemApiUrl}: ${response.statusText}, Body: ${errorBody}`);
+                throw new Error(`Failed to fetch Bitcoin ${analysisType}: ${response.statusText}`);
+            }
+            itemData = await response.json();
+        } else if (determinedNetwork === 'stacks') {
+            const stacksApi = new StacksApiService(determinedSubNetwork as 'mainnet' | 'testnet');
+            if (analysisType === 'block') {
+                itemData = await stacksApi.getBlock(normalizedId);
+            } else { 
+                const rawTxData = await stacksApi.getTransaction(normalizedId);
+                itemData = formatStacksTransaction(rawTxData as StacksTransaction); // Cast to ensure type
+            }
+        }
         
-        // Fetch transaction data
-        const analysis = await BitcoinAnalyzerService.analyzeTransaction(
-          normalizedTxHash, 
-          transactionNetwork as 'bitcoin' | 'stacks', 
-          selectedSubNetwork as 'mainnet' | 'testnet'
-        );
+        console.log(`${analysisType} analysis successful. Data (first 200 chars):`, itemData ? JSON.stringify(itemData).substring(0,200) : "No data");
         
-        transactionData = analysis.data;
-        
-        console.log('Transaction analysis successful, data:', 
-          JSON.stringify(transactionData, null, 2).substring(0, 200) + '...');
-        
-        // If the last message doesn't include the transaction hash, append it
         const lastMsg = userMessages[userMessages.length - 1];
         if (lastMsg.role === 'user' && !lastMsg.content.includes(txHash)) {
           userMessages[userMessages.length - 1] = {
             ...lastMsg,
-            content: `Analyze this ${transactionNetwork} transaction in detail: ${txHash}`
+            content: `${lastMsg.content} (Regarding ${determinedNetwork} ${analysisType}: ${txHash} on ${determinedSubNetwork})`
           };
         }
       } catch (error) {
-        console.error('Error analyzing transaction:', error);
+        console.error(`Error analyzing ${determinedNetwork} ${analysisType} ${txHash}:`, error);
+        itemData = null; 
+        userMessages.push({ role: 'system', content: `Note: Failed to fetch complete data for ${txHash} on ${determinedNetwork} (${determinedSubNetwork}). Analyze based on the hash pattern and general knowledge if possible, or state that specific details could not be fetched. Error: ${error instanceof Error ? error.message : String(error)}`});
       }
+    } else if (userMessages.length > 0 && userMessages[userMessages.length-1].role === 'user'){
+        analysisType = 'question';
     }
     
-    // Construct the appropriate system prompt based on the transaction type
     let fullSystemPrompt = SYSTEM_PROMPT;
     
-    if (transactionNetwork === 'bitcoin') {
+    if (analysisType === 'block') {
+        fullSystemPrompt = fullSystemPrompt.replace('TRANSACTION OVERVIEW:', 'BLOCK OVERVIEW:');
+        fullSystemPrompt = fullSystemPrompt.replace('TRANSFER ANALYSIS:', 'BLOCK CONTENTS:');
+        fullSystemPrompt += BLOCK_ANALYSIS_FORMAT_COMMON;
+        fullSystemPrompt += COMMON_COMPLETION_FORMAT;
+    } else if (determinedNetwork === 'bitcoin') {
       fullSystemPrompt += BITCOIN_ANALYSIS_FORMAT + COMMON_COMPLETION_FORMAT;
-    } else if (transactionNetwork === 'stacks') {
+    } else if (determinedNetwork === 'stacks') {
       fullSystemPrompt += STACKS_ANALYSIS_FORMAT + COMMON_COMPLETION_FORMAT;
-    } else if (transactionNetwork.startsWith('sidechain-')) {
-      const sidechainType = transactionNetwork.split('-')[1];
-      
-      console.log(`Analyzing ${sidechainType} sidechain transaction: ${txHash}`);
-      
-      // Add the sidechain-specific system prompt
+    } else if (determinedNetwork.startsWith('sidechain-')) {
       fullSystemPrompt += SIDECHAIN_ANALYSIS_FORMAT + COMMON_COMPLETION_FORMAT;
-      
-      try {
-        // Initialize the BIP300Service
-        const bip300Service = new BIP300Service(sidechainType);
-        
-        // Try to fetch transaction data
-        const txData = await bip300Service.getTransaction(txHash);
-        
-        // Add transaction data to the prompt
-        transactionData = txData;
-        
-        console.log('Sidechain transaction analysis successful, data:', 
-          JSON.stringify(transactionData, null, 2).substring(0, 200) + '...');
-        
-        // Make sure the last message includes the transaction hash
-        const lastMsg = userMessages[userMessages.length - 1];
-        if (lastMsg.role === 'user' && !lastMsg.content.includes(txHash)) {
-          userMessages[userMessages.length - 1] = {
-            ...lastMsg,
-            content: `Analyze this ${sidechainType} sidechain transaction in detail: ${txHash}`
-          };
-        }
-      } catch (error) {
-        console.error('Error analyzing sidechain transaction:', error);
-      }
-      
-      // Check if this is a block analysis request
-      if (userMessages[userMessages.length - 1].content.includes('block')) {
-        const sidechainType = transactionNetwork.split('-')[1];
-        
-        console.log(`Analyzing ${sidechainType} sidechain block: ${txHash}`);
-        
-        try {
-          // Initialize the BIP300Service
-          const bip300Service = new BIP300Service(sidechainType);
-          
-          // Try to fetch block data
-          const blockData = await bip300Service.getBlock(txHash);
-          
-          // Add block data to the prompt
-          transactionData = blockData;
-          
-          console.log('Sidechain block analysis successful, data:', 
-            JSON.stringify(transactionData, null, 2).substring(0, 200) + '...');
-          
-          // Update the system prompt to include block specific information
-          fullSystemPrompt += `\n\nYou are analyzing a BIP300 sidechain block. Include details about the block's structure, included transactions, and relationship to the main Bitcoin chain.`;
-        } catch (error) {
-          console.error('Error analyzing sidechain block:', error);
-        }
-      }
-    } else {
-      // If no specific transaction type, use both formats
+    } else { 
       fullSystemPrompt += `
-For Bitcoin transactions:
-${BITCOIN_ANALYSIS_FORMAT}
-
-For Stacks transactions:
-${STACKS_ANALYSIS_FORMAT}
+You are a general blockchain assistant. The user has not specified a transaction/block type or it was unrecognized. Provide helpful information based on the query.
+If data is provided below, use it. Otherwise, answer generally.
 ${COMMON_COMPLETION_FORMAT}`;
     }
     
-    // Add any transaction data we fetched
-    if (transactionData) {
-      fullSystemPrompt += `\n\nHere is the transaction data, use it to enrich your analysis: ${JSON.stringify(transactionData, null, 2)}`;
+    if (itemData) {
+      fullSystemPrompt += `\n\nUse the following JSON data (referred to as 'Data' in instructions) to provide a detailed analysis. Ensure every field in your response is populated with actual data from this JSON, or state 'Not available' if a specific piece of data is missing. DO NOT use placeholders like "[value]", "[number]", etc. in your response.\n\nData: ${JSON.stringify(itemData, null, 2)}`;
       
-      // Add special handling for Stacks transactions
-      if (transactionNetwork === 'stacks') {
-        fullSystemPrompt += `\n\nIMPORTANT STACKS TRANSACTION INSTRUCTIONS:
+      if (determinedNetwork === 'stacks' && analysisType === 'transaction') {
+        // Escaped backticks for Data and sbtcDetails.amount
+        fullSystemPrompt += `\n\nIMPORTANT STACKS TRANSACTION INSTRUCTIONS (using the provided Data JSON):
 
-1. DO NOT use placeholder text like "[value] STX" or "[number]" in your response. Instead, use actual values from the transaction data.
-
-2. If any data fields are missing, say "Not available" instead of using placeholders.
-
-3. For Stacks transactions, always include these specific details:
-   - Sender address: "${transactionData?.senderFull || transactionData?.sender || 'Not available'}"
-   - Transaction status: "${transactionData?.status || 'Not available'}"
-   - Transaction type: "${transactionData?.type || 'Not available'}"
-   - Block height: ${transactionData?.blockHeight || 'Not available'}
-   - Timestamp: "${transactionData?.timestamp || 'Not available'}"
-   - Fee paid: ${transactionData?.fee || 'Not available'} STX
-   
-4. For token transfers, include:
-   - Amount: ${transactionData?.value || 'Not available'} STX
-   - Recipient: "${transactionData?.recipient || 'Not available'}"
-   - Memo: "${transactionData?.memo || 'Not available'}"
-   
-5. For contract calls, include:
-   - Contract ID: "${transactionData?.contractId || 'Not available'}"
-   - Function name: "${transactionData?.functionName || 'Not available'}"
-   
-6. For sBTC operations, include all details from: ${JSON.stringify(transactionData?.sbtcDetails || {}, null, 2)}
-
-This data is the source of truth - use it to fill in all relevant sections of your analysis.`;
+1.  Adhere strictly to the section headers: TRANSACTION OVERVIEW, NETWORK DETAILS, TRANSFER ANALYSIS (with sub-sections STX Transfers, sBTC Operations, Contract Interactions), FEE ANALYSIS, SECURITY ASSESSMENT, ADDITIONAL INSIGHTS.
+2.  For "STX Transfers", find and detail 'Amount' (from the 'value' field in the Data JSON if it represents STX), 'From' (from 'senderFull' field), 'To' (from 'recipient' field), 'Memo' (from 'memo' field).
+3.  For "sBTC Operations", use the 'sbtcDetails' object in the Data JSON, detailing 'Type', 'Amount', 'From', 'To', 'Status', 'Associated Bitcoin Transaction', 'Fee', 'Memo', 'Contract ID', 'Function Name', and 'Gas Cost Analysis' if available.
+4.  For "Contract Interactions", use 'contractId', 'functionName', and 'args' from the Data JSON. Infer 'Purpose' based on these.
+5.  All values (amounts, fees, addresses, names, IDs, statuses, timestamps, block heights, etc.) MUST come from the \\\`Data\\\` JSON. If a value is not present in the JSON or is null/undefined/empty, state 'Not available'.
+6.  Pay close attention to the \\\`type\\\` field in the Data JSON (e.g., "STX Transfer", "Contract Call: some_function", "sBTC Deposit") to correctly categorize and describe the transaction in the TRANSACTION OVERVIEW and other relevant sections.
+7.  The \\\`Data\\\` JSON is the source of truth. If specific details are nested (e.g., \\\`sbtcDetails.amount\\\`), extract them.
+8.  For fee rates, use µSTX. For STX amounts, use STX. For sBTC amounts, use sBTC.`;
       }
+    } else if (txHash) {
+        fullSystemPrompt += `\n\nAnalysis for ${txHash} on ${determinedNetwork}(${determinedSubNetwork}): Data retrieval was unsuccessful or incomplete. Please provide general information about this type of ${analysisType} if possible, or state that specific details could not be fetched.`;
     }
     
-    // Prepare messages array with system prompt
     const apiMessages = [
       { role: 'system', content: fullSystemPrompt },
       ...userMessages,
     ];
     
-    // Request to OpenAI API
+    // console.log("Full system prompt sent to OpenAI:", fullSystemPrompt); 
+    // console.log("Last user message to OpenAI:", userMessages[userMessages.length -1]);
+    // if (itemData) {
+    //     console.log("Item data being sent to OpenAI (first 500 chars):", JSON.stringify(itemData, null, 2).substring(0, 500) + "...");
+    // } else if (txHash) {
+    //     console.log("No itemData, but txHash was present:", txHash);
+    // }
+
     const response = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-4o', 
       messages: apiMessages,
-      temperature: 0.7,
+      temperature: 0.2, 
       stream: true,
     });
     
-    // Create a stream from the response
     const stream = OpenAIStream(response);
     
-    // Return streaming response
     return new StreamingTextResponse(stream);
   } catch (error) {
-    console.error('API Error:', error);
+    console.error('API Error in POST handler:', error);
     return new Response(
-      JSON.stringify({ error: 'An error occurred during API call' }),
+      JSON.stringify({ error: 'An error occurred during API call', details: error instanceof Error ? error.message : String(error) }),
       { status: 500, headers: { 'content-type': 'application/json' } }
     );
   }
 }
 
-export const maxDuration = 300; // 5 minutes max duration
+export const maxDuration = 300;
