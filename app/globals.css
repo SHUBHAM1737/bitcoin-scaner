@@ -1,0 +1,38 @@
+/* app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bitcoin-orange: #f7931a;
+  --stacks-purple: #5546FF;
+}
+
+body {
+  background-color: #f9f9f9;
+}
+
+.bitcoin-gradient {
+  background: linear-gradient(135deg, #f7931a 0%, #c27214 100%);
+}
+
+.stacks-gradient {
+  background: linear-gradient(135deg, #5546FF 0%, #3b30c9 100%);
+}
+
+/* Add container styles to ensure consistent layout */
+.container {
+  width: 100%;
+  max-width: 1280px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Add some responsive breakpoints for the container */
+@media (max-width: 1320px) {
+  .container {
+    max-width: 100%;
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
